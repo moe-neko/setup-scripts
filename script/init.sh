@@ -13,13 +13,29 @@ MARKER="$HOME/.initial_update_done"
 ZSH_CUSTOM=${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}
 
 # =================================================================
-# 辅助函数：提权执行
+# 新增：提权命令处理（核心修改）
 # =================================================================
-# 检查 sudo 权限，如果没有则尝试获取
-check_sudo() {
-    if ! sudo -v; then
-        echo -e "${RED}错误: 需要 sudo 权限执行系统级任务。${NC}"
-        exit 1
+if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+    echo -e "${GREEN}已检测到 sudo，将使用 sudo 执行需要权限的操作${NC}"
+else
+    SUDO=""
+    echo -e "${YELLOW}未检测到 sudo，将以当前用户权限直接执行（推荐使用 root 用户运行）${NC}"
+fi
+
+# 检查权限：没有 sudo 时必须是 root 用户
+if [ -z "$SUDO" ] && [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误: 当前既没有 sudo 权限，也没有以 root 用户运行脚本。${NC}"
+    echo -e "${RED}请切换到 root 用户（su - 或直接用 root 登录）后重新运行。${NC}"
+    exit 1
+fi
+
+# 统一的提权执行函数
+run_as_root() {
+    if [ -n "$SUDO" ]; then
+        $SUDO "$@"
+    else
+        "$@"
     fi
 }
 
@@ -31,18 +47,23 @@ if [ ! -f "$MARKER" ]; then
 
     # 1. Update & Upgrade
     echo -e "${GREEN}[1/3] 正在更新系统软件包...${NC}"
-    sudo apt update && sudo apt upgrade -y
+    run_as_root apt update && run_as_root apt upgrade -y
 
     # 2. 安装基础依赖
     echo -e "${GREEN}[2/3] 安装基础工具集...${NC}"
     DEPENDS=(zsh unzip git command-not-found htop net-tools bind9-dnsutils neovim wget curl mtr tmux ufw)
-    sudo apt install -y "${DEPENDS[@]}"
+    run_as_root apt install -y "${DEPENDS[@]}"
 
     # 3. 配置 Oh-My-Zsh (针对当前用户)
     echo -e "${GREEN}[3/3] 配置 Oh-My-Zsh 环境...${NC}"
     if [ ! -d "$HOME/.oh-my-zsh" ]; then
         sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-        sudo chsh -s $(which zsh) $USER
+        # 只有在有 sudo 时才使用 sudo chsh（root 用户不需要 sudo）
+        if [ -n "$SUDO" ]; then
+            run_as_root chsh -s "$(which zsh)" "$USER"
+        else
+            chsh -s "$(which zsh)" "$USER" 2>/dev/null || true
+        fi
     fi
 
     # 安装插件与主题
@@ -69,7 +90,7 @@ fi
 echo -e "${GREEN}[4/6] SSH 安全增强配置...${NC}"
 OVERWRITE_CONF="/etc/ssh/sshd_config.d/99-overwrite.conf"
 
-# 准备临时文件以避免 sudo 权限下的重定向麻烦
+# 准备临时文件
 TEMP_SSH_CONF=$(mktemp)
 
 # 公钥配置
@@ -86,8 +107,7 @@ fi
 read -p "是否更改 SSH 端口？(默认不修改输入n, 否则输入端口号): " ssh_port
 if [[ $ssh_port =~ ^[0-9]+$ ]]; then
     echo "Port $ssh_port" >> "$TEMP_SSH_CONF"
-    check_sudo
-    sudo ufw allow "$ssh_port"/tcp
+    run_as_root ufw allow "$ssh_port"/tcp
     echo -e "${YELLOW}已在 UFW 中放行端口 $ssh_port${NC}"
 fi
 
@@ -99,17 +119,17 @@ fi
 
 # 写入配置文件
 if [ -s "$TEMP_SSH_CONF" ]; then
-    check_sudo
-    sudo mkdir -p /etc/ssh/sshd_config.d/
-    sudo cp "$TEMP_SSH_CONF" "$OVERWRITE_CONF"
+    run_as_root mkdir -p /etc/ssh/sshd_config.d/
+    run_as_root cp "$TEMP_SSH_CONF" "$OVERWRITE_CONF"
     
-    # 重启 SSH 服务 (兼容 Ubuntu 24.04 socket 模式)
-    sudo systemctl daemon-reload
-    if sudo systemctl is-active --quiet ssh.socket; then
-        sudo systemctl restart ssh.socket
+    # 重启 SSH 服务 (兼容 Ubuntu 24.04 / Debian socket 模式)
+    run_as_root systemctl daemon-reload
+    if run_as_root systemctl is-active --quiet ssh.socket; then
+        run_as_root systemctl restart ssh.socket
     else
-        sudo systemctl restart ssh
+        run_as_root systemctl restart ssh
     fi
+    echo -e "${GREEN}SSH 配置已更新并重启${NC}"
 fi
 rm -f "$TEMP_SSH_CONF"
 
@@ -119,46 +139,40 @@ rm -f "$TEMP_SSH_CONF"
 echo -e "${GREEN}[5/6] 进入可选组件安装...${NC}"
 
 install_caddy() {
-    check_sudo
-    sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-    sudo apt update && sudo apt install caddy -y
-    sudo ufw allow http && sudo ufw allow https
+    run_as_root apt install -y debian-keyring debian-archive-keyring apt-transport-https
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | run_as_root gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | run_as_root tee /etc/apt/sources.list.d/caddy-stable.list
+    run_as_root apt update && run_as_root apt install caddy -y
+    run_as_root ufw allow http && run_as_root ufw allow https
 }
 
 install_docker() {
     curl -fsSL https://get.docker.com -o get-docker.sh
-    sudo sh get-docker.sh && rm get-docker.sh
+    run_as_root sh get-docker.sh && rm get-docker.sh
 }
 
 install_easytier() {
     wget -O /tmp/easytier.sh "https://raw.githubusercontent.com/EasyTier/EasyTier/main/script/install.sh"
-    sudo bash /tmp/easytier.sh install --no-gh-proxy
-    sudo systemctl disable --now easytier@default
+    run_as_root bash /tmp/easytier.sh install --no-gh-proxy
+    run_as_root systemctl disable --now easytier@default
     echo -e "${YELLOW}EasyTier 已安装。请手动编辑 /opt/easytier/config/default.conf${NC}"
 }
 
 install_singbox() {
-    check_sudo
-    sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://sing-box.app/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/sagernet.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/sagernet.gpg] https://deb.sagernet.org/ * main" | sudo tee /etc/apt/sources.list.d/sagernet.list
-    sudo apt update && sudo apt install sing-box -y
+    run_as_root mkdir -p /etc/apt/keyrings
+    curl -fsSL https://sing-box.app/gpg.key | run_as_root gpg --dearmor -o /etc/apt/keyrings/sagernet.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/sagernet.gpg] https://deb.sagernet.org/ * main" | run_as_root tee /etc/apt/sources.list.d/sagernet.list
+    run_as_root apt update && run_as_root apt install sing-box -y
 }
 
 install_log_maintenance() {
     echo -e "${GREEN}配置日志限制与自动清理...${NC}"
-    check_sudo
-
-    # ================================
+    
     # 1. 配置 journald 限制
-    # ================================
     JOURNAL_CONF="/etc/systemd/journald.conf.d/99-custom.conf"
+    run_as_root mkdir -p /etc/systemd/journald.conf.d/
 
-    sudo mkdir -p /etc/systemd/journald.conf.d/
-
-    sudo tee "$JOURNAL_CONF" > /dev/null <<EOF
+    run_as_root tee "$JOURNAL_CONF" > /dev/null <<EOF
 [Journal]
 SystemMaxUse=100M
 SystemKeepFree=200M
@@ -168,15 +182,12 @@ EOF
 
     echo -e "${GREEN}journald 限制已写入 ${JOURNAL_CONF}${NC}"
 
-    # 重启 journald 使配置生效
-    sudo systemctl restart systemd-journald
+    # 重启 journald
+    run_as_root systemctl restart systemd-journald
 
-    # ================================
     # 2. 创建清理脚本
-    # ================================
     CLEAN_SCRIPT="/usr/local/bin/system-cleanup.sh"
-
-    sudo tee "$CLEAN_SCRIPT" > /dev/null <<'EOF'
+    run_as_root tee "$CLEAN_SCRIPT" > /dev/null <<'EOF'
 #!/bin/bash
 
 # apt 缓存清理
@@ -188,14 +199,11 @@ journalctl --vacuum-time=1s
 
 EOF
 
-    sudo chmod +x "$CLEAN_SCRIPT"
+    run_as_root chmod +x "$CLEAN_SCRIPT"
 
-    # ================================
     # 3. 创建 systemd service
-    # ================================
     SERVICE_FILE="/etc/systemd/system/system-cleanup.service"
-
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+    run_as_root tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=Monthly System Cleanup
 
@@ -204,12 +212,9 @@ Type=oneshot
 ExecStart=$CLEAN_SCRIPT
 EOF
 
-    # ================================
     # 4. 创建 systemd timer（每月执行）
-    # ================================
     TIMER_FILE="/etc/systemd/system/system-cleanup.timer"
-
-    sudo tee "$TIMER_FILE" > /dev/null <<EOF
+    run_as_root tee "$TIMER_FILE" > /dev/null <<EOF
 [Unit]
 Description=Run system cleanup monthly
 
@@ -222,9 +227,9 @@ WantedBy=timers.target
 EOF
 
     # 启用 timer
-    sudo systemctl daemon-reexec
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now system-cleanup.timer
+    run_as_root systemctl daemon-reexec
+    run_as_root systemctl daemon-reload
+    run_as_root systemctl enable --now system-cleanup.timer
 
     echo -e "${GREEN}日志限制 + 自动清理已启用（每月执行）${NC}"
 }
